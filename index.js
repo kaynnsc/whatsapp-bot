@@ -1,146 +1,241 @@
-const { Client, LocalAuth, MessageMedia } = require("whatsapp-web.js");
-const qrcode = require("qrcode-terminal");
+const {
+  default: makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason,
+  jidNormalizedUser,
+  downloadMediaMessage
+} = require("@whiskeysockets/baileys");
+const express = require("express");
 const fs = require("fs");
 
-// Simpan daftar custom command
+// ==== FILES ====
 const COMMANDS_FILE = "commands.json";
+const WELCOME_BYE_FILE = "welcome_bye.json";
+
+// ==== LOAD DATA ====
 let customCommands = {};
 if (fs.existsSync(COMMANDS_FILE)) {
   try {
-    customCommands = JSON.parse(fs.readFileSync(COMMANDS_FILE));
+    customCommands = JSON.parse(fs.readFileSync(COMMANDS_FILE, "utf8"));
   } catch (e) {
-    console.error("❌ Gagal membaca commands.json:", e);
+    console.error("❌ Error load commands:", e);
+  }
+}
+let welcomeByeMsg = { welcome: "", bye: "" };
+if (fs.existsSync(WELCOME_BYE_FILE)) {
+  try {
+    welcomeByeMsg = JSON.parse(fs.readFileSync(WELCOME_BYE_FILE, "utf8"));
+  } catch (e) {
+    console.error("❌ Error load welcome/bye:", e);
   }
 }
 
-// Inisialisasi client
-const client = new Client({
-  authStrategy: new LocalAuth(),
-});
-
-client.on("qr", (qr) => {
-  qrcode.generate(qr, { small: true });
-});
-
-client.on("ready", () => {
-  console.log("✅ Bot is running!");
-});
-
-// Fungsi untuk simpan command
 function saveCommands() {
   fs.writeFileSync(COMMANDS_FILE, JSON.stringify(customCommands, null, 2));
 }
-
-// Replace placeholder
-function replacePlaceholders(text, msg) {
-  const date = new Date();
-  return text
-    .replace(/@group/gi, msg.from.endsWith("@g.us") ? msg._data.notifyName || "Grup ini" : "Chat ini")
-    .replace(/@date/gi, date.toLocaleDateString("id-ID"))
-    .replace(/@time/gi, date.toLocaleTimeString("id-ID"));
+function saveWelcomeBye() {
+  fs.writeFileSync(WELCOME_BYE_FILE, JSON.stringify(welcomeByeMsg, null, 2));
 }
 
-client.on("message", async (msg) => {
-  const chat = await msg.getChat();
-  const isGroup = chat.isGroup;
-  const isAdmin = isGroup && chat.participants.find(p => p.id._serialized === msg.author)?.isAdmin;
+// ==== PLACEHOLDER ====
+function replacePlaceholders(text, m, chatName) {
+  if (!text) return text;
+  let result = text;
+  if (chatName) result = result.replace(/@group/gi, chatName);
+  const d = new Date();
+  result = result.replace(/@date/gi, d.toLocaleDateString("id-ID"));
+  result = result.replace(/@time/gi, d.toLocaleTimeString("id-ID"));
+  return result;
+}
 
-  const body = msg.body.trim();
-
-  // ---- ADDLIST ----
-  if (body.startsWith(".addlist")) {
-    const input = body.replace(".addlist", "").trim();
-    let [name, ...contentArr] = input.split("||");
-    if (!name) {
-      msg.reply("⚠️ Format salah.\nGunakan:\n.addlist nama || isi\nAtau reply media dengan .addlist nama");
-      return;
-    }
-    name = name.trim().toLowerCase();
-    let content = contentArr.join("||").trim();
-
-    if (msg.hasMedia && !content) {
-      const media = await msg.downloadMedia();
-      customCommands[name] = { type: "media", media };
-    } else {
-      customCommands[name] = { type: "text", text: content };
-    }
-
-    saveCommands();
-    msg.reply(`✅ List '${name}' berhasil ditambahkan.`);
-    return;
+// ==== ADMIN CHECK ====
+async function isGroupAdmin(sock, jid, sender) {
+  try {
+    const metadata = await sock.groupMetadata(jid);
+    const participant = metadata.participants.find(
+      (p) => jidNormalizedUser(p.id) === jidNormalizedUser(sender)
+    );
+    return participant?.admin !== null && participant?.admin !== undefined;
+  } catch {
+    return false;
   }
+}
 
-  // ---- UPDATELIST ----
-  if (body.startsWith(".updatelist")) {
-    const input = body.replace(".updatelist", "").trim();
-    let [name, ...contentArr] = input.split("||");
-    if (!name) {
-      msg.reply("⚠️ Format salah.\nGunakan:\n.updatelist nama || isi\nAtau reply media dengan .updatelist nama");
-      return;
+// ==== START BOT ====
+async function startBot() {
+  const { state, saveCreds } = await useMultiFileAuthState("auth");
+  const sock = makeWASocket({
+    auth: state,
+    printQRInTerminal: true,
+  });
+
+  sock.ev.on("creds.update", saveCreds);
+
+  // ==== MESSAGE HANDLER ====
+  sock.ev.on("messages.upsert", async ({ messages }) => {
+    const msg = messages[0];
+    if (!msg.message) return;
+
+    const from = msg.key.remoteJid;
+    const sender = msg.key.participant || msg.key.remoteJid;
+    const isGroup = from.endsWith("@g.us");
+
+    let body = "";
+    if (msg.message.conversation) body = msg.message.conversation;
+    else if (msg.message.extendedTextMessage)
+      body = msg.message.extendedTextMessage.text;
+    else if (msg.message.imageMessage && msg.message.imageMessage.caption)
+      body = msg.message.imageMessage.caption;
+
+    body = body ? body.trim() : "";
+
+    // ADDLIST
+    if (body.startsWith(".addlist ")) {
+      if (!(await isGroupAdmin(sock, from, sender)))
+        return sock.sendMessage(from, { text: "❌ Only admin can use this." });
+
+      const input = body.slice(9).split("||");
+      const key = input[0].trim().toLowerCase();
+      const value = input[1] ? input[1].trim() : "";
+
+      if (msg.message.imageMessage || msg.message.videoMessage) {
+        const buffer = await downloadMediaMessage(msg, "buffer", {});
+        customCommands[key] = {
+          text: value,
+          media: {
+            mimetype: msg.message.imageMessage
+              ? msg.message.imageMessage.mimetype
+              : msg.message.videoMessage.mimetype,
+            data: buffer.toString("base64"),
+            type: msg.message.imageMessage ? "image" : "video",
+          },
+        };
+      } else {
+        customCommands[key] = { text: value };
+      }
+
+      saveCommands();
+      return sock.sendMessage(from, { text: `✅ List "${key}" added!` });
     }
-    name = name.trim().toLowerCase();
-    let content = contentArr.join("||").trim();
 
-    if (!customCommands[name]) {
-      msg.reply(`❌ List '${name}' belum ada. Gunakan .addlist untuk membuat baru.`);
-      return;
+    // UPDATELIST
+    if (body.startsWith(".updatelist ")) {
+      if (!(await isGroupAdmin(sock, from, sender)))
+        return sock.sendMessage(from, { text: "❌ Only admin can use this." });
+
+      const input = body.slice(12).split("||");
+      const key = input[0].trim().toLowerCase();
+      const value = input[1] ? input[1].trim() : "";
+
+      if (!customCommands[key])
+        return sock.sendMessage(from, { text: `❌ List "${key}" not found!` });
+
+      if (msg.message.imageMessage || msg.message.videoMessage) {
+        const buffer = await downloadMediaMessage(msg, "buffer", {});
+        customCommands[key] = {
+          text: value,
+          media: {
+            mimetype: msg.message.imageMessage
+              ? msg.message.imageMessage.mimetype
+              : msg.message.videoMessage.mimetype,
+            data: buffer.toString("base64"),
+            type: msg.message.imageMessage ? "image" : "video",
+          },
+        };
+      } else {
+        customCommands[key] = { text: value };
+      }
+
+      saveCommands();
+      return sock.sendMessage(from, { text: `♻️ List "${key}" updated!` });
     }
 
-    if (msg.hasMedia && !content) {
-      const media = await msg.downloadMedia();
-      customCommands[name] = { type: "media", media };
-    } else {
-      customCommands[name] = { type: "text", text: content };
+    // LISTALL
+    if (body === ".listall") {
+      const keys = Object.keys(customCommands);
+      if (keys.length === 0)
+        return sock.sendMessage(from, { text: "📭 No list found." });
+      return sock.sendMessage(from, {
+        text: "📋 Available lists:\n" + keys.map((k) => `- ${k}`).join("\n"),
+      });
     }
 
-    saveCommands();
-    msg.reply(`✅ List '${name}' berhasil diperbarui.`);
-    return;
-  }
+    // HIDETAG
+    if (body.startsWith(".h")) {
+      if (!(await isGroupAdmin(sock, from, sender)))
+        return sock.sendMessage(from, { text: "❌ Only admin can use this." });
 
-  // ---- HIDETAG (.h) ----
-  if (body.startsWith(".h")) {
-    let text = body.replace(".h", "").trim();
-
-    if (msg.hasQuotedMsg) {
-      const quoted = await msg.getQuotedMessage();
-      text = quoted.body || text;
+      const metadata = await sock.groupMetadata(from);
+      const text = body.slice(2).trim();
+      return sock.sendMessage(from, {
+        text: text || "⚠️ Empty",
+        mentions: metadata.participants.map((p) => p.id),
+      });
     }
 
-    text = replacePlaceholders(text, msg);
+    // SHUTDOWN
+    if (body === ".shutdown") {
+      if (!(await isGroupAdmin(sock, from, sender)))
+        return sock.sendMessage(from, { text: "❌ Only admin can shutdown." });
 
-    if (isGroup) {
-      const mentions = chat.participants.map((p) => p.id._serialized);
-      chat.sendMessage(text, { mentions });
-    } else {
-      msg.reply(text);
+      await sock.sendMessage(from, { text: "🛑 Bot shutting down..." });
+      process.exit(0);
     }
-    return;
-  }
 
-  // ---- SHUTDOWN ----
-  if (body === ".shutdown") {
-    if (isAdmin) {
-      msg.reply("⚠️ Bot dimatikan oleh admin grup.");
-      setTimeout(() => process.exit(0), 1000);
-    } else {
-      msg.reply("❌ Hanya admin yang bisa mematikan bot.");
+    // TRIGGER LIST
+    const key = body.toLowerCase();
+    if (customCommands[key]) {
+      const cmd = customCommands[key];
+      const text = replacePlaceholders(cmd.text, msg, isGroup ? from : null);
+
+      if (cmd.media) {
+        const buffer = Buffer.from(cmd.media.data, "base64");
+        await sock.sendMessage(from, {
+          [cmd.media.type]: buffer,
+          mimetype: cmd.media.mimetype,
+          caption: text,
+        });
+      } else {
+        await sock.sendMessage(from, { text });
+      }
     }
-    return;
-  }
+  });
 
-  // ---- TRIGGER LIST ----
-  const cmd = body.toLowerCase();
-  if (customCommands[cmd]) {
-    const data = customCommands[cmd];
-    if (data.type === "text") {
-      const text = replacePlaceholders(data.text, msg);
-      msg.reply(text);
-    } else if (data.type === "media") {
-      const media = new MessageMedia(data.media.mimetype, data.media.data, data.media.filename);
-      client.sendMessage(msg.from, media, { caption: replacePlaceholders(data.media.caption || "", msg) });
+  // ==== GROUP WELCOME / BYE ====
+  sock.ev.on("group-participants.update", async (update) => {
+    const metadata = await sock.groupMetadata(update.id);
+    if (update.action === "add" && welcomeByeMsg.welcome) {
+      for (let user of update.participants) {
+        await sock.sendMessage(update.id, {
+          text: replacePlaceholders(
+            welcomeByeMsg.welcome.replace(/@user/gi, `@${user.split("@")[0]}`),
+            {},
+            metadata.subject
+          ),
+          mentions: [user],
+        });
+      }
     }
-  }
-});
+    if (update.action === "remove" && welcomeByeMsg.bye) {
+      for (let user of update.participants) {
+        await sock.sendMessage(update.id, {
+          text: replacePlaceholders(
+            welcomeByeMsg.bye.replace(/@user/gi, `@${user.split("@")[0]}`),
+            {},
+            metadata.subject
+          ),
+          mentions: [user],
+        });
+      }
+    }
+  });
+}
 
-client.initialize();
+// ==== EXPRESS SERVER ====
+const app = express();
+const port = process.env.PORT || 3000;
+app.get("/", (req, res) => res.send("Bot is running!"));
+app.listen(port, () => console.log(`Server running at port ${port}`));
+
+// RUN
+startBot();
