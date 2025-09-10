@@ -1,241 +1,196 @@
-const {
-  default: makeWASocket,
-  useMultiFileAuthState,
-  DisconnectReason,
-  jidNormalizedUser,
-  downloadMediaMessage
-} = require("@whiskeysockets/baileys");
-const express = require("express");
-const fs = require("fs");
+// Import modules
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
+const pino = require('pino');
+const fs = require('fs');
+const path = require('path');
+const qrcode = require('qrcode-terminal');
 
-// ==== FILES ====
-const COMMANDS_FILE = "commands.json";
-const WELCOME_BYE_FILE = "welcome_bye.json";
+// Direktori & file
+const SESSION_DIR = './sessions';
+const CONFIG_DIR = './config';
+const LIST_FILE = path.join(CONFIG_DIR, 'lists.json');
+const GROUP_FILE = path.join(CONFIG_DIR, 'groups.json');
 
-// ==== LOAD DATA ====
-let customCommands = {};
-if (fs.existsSync(COMMANDS_FILE)) {
-  try {
-    customCommands = JSON.parse(fs.readFileSync(COMMANDS_FILE, "utf8"));
-  } catch (e) {
-    console.error("❌ Error load commands:", e);
-  }
-}
-let welcomeByeMsg = { welcome: "", bye: "" };
-if (fs.existsSync(WELCOME_BYE_FILE)) {
-  try {
-    welcomeByeMsg = JSON.parse(fs.readFileSync(WELCOME_BYE_FILE, "utf8"));
-  } catch (e) {
-    console.error("❌ Error load welcome/bye:", e);
-  }
-}
+// Pastikan folder ada
+if (!fs.existsSync(SESSION_DIR)) fs.mkdirSync(SESSION_DIR, { recursive: true });
+if (!fs.existsSync(CONFIG_DIR)) fs.mkdirSync(CONFIG_DIR, { recursive: true });
+if (!fs.existsSync(LIST_FILE)) fs.writeFileSync(LIST_FILE, JSON.stringify({}));
+if (!fs.existsSync(GROUP_FILE)) fs.writeFileSync(GROUP_FILE, JSON.stringify({}));
 
-function saveCommands() {
-  fs.writeFileSync(COMMANDS_FILE, JSON.stringify(customCommands, null, 2));
-}
-function saveWelcomeBye() {
-  fs.writeFileSync(WELCOME_BYE_FILE, JSON.stringify(welcomeByeMsg, null, 2));
-}
+// Helper read/write
+const readLists = () => JSON.parse(fs.readFileSync(LIST_FILE, 'utf-8'));
+const writeLists = (d) => fs.writeFileSync(LIST_FILE, JSON.stringify(d, null, 2));
+const readGroups = () => JSON.parse(fs.readFileSync(GROUP_FILE, 'utf-8'));
+const writeGroups = (d) => fs.writeFileSync(GROUP_FILE, JSON.stringify(d, null, 2));
 
-// ==== PLACEHOLDER ====
-function replacePlaceholders(text, m, chatName) {
+// Replace placeholder
+function replacePlaceholders(text, msg, chatName) {
   if (!text) return text;
-  let result = text;
-  if (chatName) result = result.replace(/@group/gi, chatName);
   const d = new Date();
-  result = result.replace(/@date/gi, d.toLocaleDateString("id-ID"));
-  result = result.replace(/@time/gi, d.toLocaleTimeString("id-ID"));
-  return result;
+  return text
+    .replace(/@group/gi, chatName || "Grup ini")
+    .replace(/@date/gi, d.toLocaleDateString("id-ID"))
+    .replace(/@time/gi, d.toLocaleTimeString("id-ID"));
 }
 
-// ==== ADMIN CHECK ====
-async function isGroupAdmin(sock, jid, sender) {
-  try {
-    const metadata = await sock.groupMetadata(jid);
-    const participant = metadata.participants.find(
-      (p) => jidNormalizedUser(p.id) === jidNormalizedUser(sender)
-    );
-    return participant?.admin !== null && participant?.admin !== undefined;
-  } catch {
-    return false;
-  }
-}
-
-// ==== START BOT ====
+// Start bot
 async function startBot() {
-  const { state, saveCreds } = await useMultiFileAuthState("auth");
-  const sock = makeWASocket({
-    auth: state,
-    printQRInTerminal: true,
-  });
+  const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
+  const sock = makeWASocket({ auth: state, logger: pino({ level: "silent" }) });
 
   sock.ev.on("creds.update", saveCreds);
+  sock.ev.on("connection.update", (update) => {
+    const { connection, qr, lastDisconnect } = update;
+    if (qr) {
+      console.log("Scan QR berikut untuk login:");
+      qrcode.generate(qr, { small: true });
+    }
+    if (connection === "open") console.log("✅ Bot terhubung!");
+    if (connection === "close") {
+      const reason = lastDisconnect?.error?.output?.statusCode;
+      if (reason !== DisconnectReason.loggedOut) startBot();
+      else console.log("❌ Logged out.");
+    }
+  });
 
-  // ==== MESSAGE HANDLER ====
+  // Message handler
   sock.ev.on("messages.upsert", async ({ messages }) => {
-    const msg = messages[0];
-    if (!msg.message) return;
+    for (const msg of messages) {
+      if (!msg.message || msg.key.remoteJid === "status@broadcast") continue;
+      const chatId = msg.key.remoteJid;
+      const isGroup = chatId.endsWith("@g.us");
+      const sender = msg.key.participant || msg.key.remoteJid;
+      const chatName = isGroup ? (await sock.groupMetadata(chatId)).subject : "Chat ini";
 
-    const from = msg.key.remoteJid;
-    const sender = msg.key.participant || msg.key.remoteJid;
-    const isGroup = from.endsWith("@g.us");
+      let body =
+        msg.message.conversation ||
+        msg.message.extendedTextMessage?.text ||
+        msg.message.imageMessage?.caption ||
+        msg.message.videoMessage?.caption ||
+        "";
 
-    let body = "";
-    if (msg.message.conversation) body = msg.message.conversation;
-    else if (msg.message.extendedTextMessage)
-      body = msg.message.extendedTextMessage.text;
-    else if (msg.message.imageMessage && msg.message.imageMessage.caption)
-      body = msg.message.imageMessage.caption;
+      body = body.trim();
+      const lists = readLists();
+      const groups = readGroups();
+      const groupConfig = groups[chatId] || { isOpen: true, welcome: "", bye: "" };
 
-    body = body ? body.trim() : "";
+      // ---- ADDLIST ----
+      if (body.startsWith(".addlist")) {
+        const input = body.replace(".addlist", "").trim();
+        let [name, ...contentArr] = input.split("||");
+        if (!name) {
+          await sock.sendMessage(chatId, { text: "⚠️ Format: .addlist nama || isi" });
+          continue;
+        }
+        name = name.trim().toLowerCase();
+        const content = contentArr.join("||").trim();
 
-    // ADDLIST
-    if (body.startsWith(".addlist ")) {
-      if (!(await isGroupAdmin(sock, from, sender)))
-        return sock.sendMessage(from, { text: "❌ Only admin can use this." });
+        if (!lists[chatId]) lists[chatId] = {};
+        if (msg.message.imageMessage || msg.message.videoMessage) {
+          const type = msg.message.imageMessage ? "image" : "video";
+          const media = msg.message[`${type}Message`];
+          lists[chatId][name] = { type, media, caption: content };
+        } else {
+          lists[chatId][name] = { type: "text", text: content };
+        }
 
-      const input = body.slice(9).split("||");
-      const key = input[0].trim().toLowerCase();
-      const value = input[1] ? input[1].trim() : "";
-
-      if (msg.message.imageMessage || msg.message.videoMessage) {
-        const buffer = await downloadMediaMessage(msg, "buffer", {});
-        customCommands[key] = {
-          text: value,
-          media: {
-            mimetype: msg.message.imageMessage
-              ? msg.message.imageMessage.mimetype
-              : msg.message.videoMessage.mimetype,
-            data: buffer.toString("base64"),
-            type: msg.message.imageMessage ? "image" : "video",
-          },
-        };
-      } else {
-        customCommands[key] = { text: value };
+        writeLists(lists);
+        await sock.sendMessage(chatId, { text: `✅ List '${name}' ditambahkan.` }, { quoted: msg });
+        continue;
       }
 
-      saveCommands();
-      return sock.sendMessage(from, { text: `✅ List "${key}" added!` });
-    }
+      // ---- UPDATELIST ----
+      if (body.startsWith(".updatelist")) {
+        const input = body.replace(".updatelist", "").trim();
+        let [name, ...contentArr] = input.split("||");
+        if (!name) {
+          await sock.sendMessage(chatId, { text: "⚠️ Format: .updatelist nama || isi" });
+          continue;
+        }
+        name = name.trim().toLowerCase();
+        const content = contentArr.join("||").trim();
 
-    // UPDATELIST
-    if (body.startsWith(".updatelist ")) {
-      if (!(await isGroupAdmin(sock, from, sender)))
-        return sock.sendMessage(from, { text: "❌ Only admin can use this." });
+        if (!lists[chatId] || !lists[chatId][name]) {
+          await sock.sendMessage(chatId, { text: `❌ List '${name}' belum ada.` });
+          continue;
+        }
 
-      const input = body.slice(12).split("||");
-      const key = input[0].trim().toLowerCase();
-      const value = input[1] ? input[1].trim() : "";
+        if (msg.message.imageMessage || msg.message.videoMessage) {
+          const type = msg.message.imageMessage ? "image" : "video";
+          const media = msg.message[`${type}Message`];
+          lists[chatId][name] = { type, media, caption: content };
+        } else {
+          lists[chatId][name] = { type: "text", text: content };
+        }
 
-      if (!customCommands[key])
-        return sock.sendMessage(from, { text: `❌ List "${key}" not found!` });
-
-      if (msg.message.imageMessage || msg.message.videoMessage) {
-        const buffer = await downloadMediaMessage(msg, "buffer", {});
-        customCommands[key] = {
-          text: value,
-          media: {
-            mimetype: msg.message.imageMessage
-              ? msg.message.imageMessage.mimetype
-              : msg.message.videoMessage.mimetype,
-            data: buffer.toString("base64"),
-            type: msg.message.imageMessage ? "image" : "video",
-          },
-        };
-      } else {
-        customCommands[key] = { text: value };
+        writeLists(lists);
+        await sock.sendMessage(chatId, { text: `♻️ List '${name}' diperbarui.` }, { quoted: msg });
+        continue;
       }
 
-      saveCommands();
-      return sock.sendMessage(from, { text: `♻️ List "${key}" updated!` });
-    }
+      // ---- HIDETAG ----
+      if (body.startsWith(".h")) {
+        const text = msg.message.extendedTextMessage?.contextInfo?.quotedMessage?.conversation ||
+          body.replace(".h", "").trim();
 
-    // LISTALL
-    if (body === ".listall") {
-      const keys = Object.keys(customCommands);
-      if (keys.length === 0)
-        return sock.sendMessage(from, { text: "📭 No list found." });
-      return sock.sendMessage(from, {
-        text: "📋 Available lists:\n" + keys.map((k) => `- ${k}`).join("\n"),
-      });
-    }
+        if (!isGroup) {
+          await sock.sendMessage(chatId, { text });
+          continue;
+        }
+        const metadata = await sock.groupMetadata(chatId);
+        const mentions = metadata.participants.map(p => p.id);
+        await sock.sendMessage(chatId, { text, mentions });
+        continue;
+      }
 
-    // HIDETAG
-    if (body.startsWith(".h")) {
-      if (!(await isGroupAdmin(sock, from, sender)))
-        return sock.sendMessage(from, { text: "❌ Only admin can use this." });
+      // ---- SHUTDOWN ----
+      if (body === ".shutdown") {
+        const metadata = await sock.groupMetadata(chatId);
+        const admins = metadata.participants.filter(p => p.admin).map(p => p.id);
+        if (admins.includes(sender)) {
+          await sock.sendMessage(chatId, { text: "🛑 Bot dimatikan oleh admin." });
+          process.exit(0);
+        } else {
+          await sock.sendMessage(chatId, { text: "❌ Hanya admin yang bisa shutdown." });
+        }
+        continue;
+      }
 
-      const metadata = await sock.groupMetadata(from);
-      const text = body.slice(2).trim();
-      return sock.sendMessage(from, {
-        text: text || "⚠️ Empty",
-        mentions: metadata.participants.map((p) => p.id),
-      });
-    }
-
-    // SHUTDOWN
-    if (body === ".shutdown") {
-      if (!(await isGroupAdmin(sock, from, sender)))
-        return sock.sendMessage(from, { text: "❌ Only admin can shutdown." });
-
-      await sock.sendMessage(from, { text: "🛑 Bot shutting down..." });
-      process.exit(0);
-    }
-
-    // TRIGGER LIST
-    const key = body.toLowerCase();
-    if (customCommands[key]) {
-      const cmd = customCommands[key];
-      const text = replacePlaceholders(cmd.text, msg, isGroup ? from : null);
-
-      if (cmd.media) {
-        const buffer = Buffer.from(cmd.media.data, "base64");
-        await sock.sendMessage(from, {
-          [cmd.media.type]: buffer,
-          mimetype: cmd.media.mimetype,
-          caption: text,
-        });
-      } else {
-        await sock.sendMessage(from, { text });
+      // ---- TRIGGER LIST ----
+      const key = body.toLowerCase();
+      if (lists[chatId] && lists[chatId][key]) {
+        const data = lists[chatId][key];
+        if (data.type === "text") {
+          const text = replacePlaceholders(data.text, msg, chatName);
+          await sock.sendMessage(chatId, { text }, { quoted: msg });
+        } else {
+          await sock.sendMessage(chatId, {
+            [data.type]: data.media,
+            caption: replacePlaceholders(data.caption, msg, chatName)
+          }, { quoted: msg });
+        }
       }
     }
   });
 
-  // ==== GROUP WELCOME / BYE ====
-  sock.ev.on("group-participants.update", async (update) => {
-    const metadata = await sock.groupMetadata(update.id);
-    if (update.action === "add" && welcomeByeMsg.welcome) {
-      for (let user of update.participants) {
-        await sock.sendMessage(update.id, {
-          text: replacePlaceholders(
-            welcomeByeMsg.welcome.replace(/@user/gi, `@${user.split("@")[0]}`),
-            {},
-            metadata.subject
-          ),
-          mentions: [user],
-        });
+  // Grup event (welcome/bye)
+  sock.ev.on("group-participants.update", async ({ id, participants, action }) => {
+    const groups = readGroups();
+    const groupConfig = groups[id] || { welcome: "", bye: "" };
+
+    if (action === "add" && groupConfig.welcome) {
+      for (const p of participants) {
+        const text = groupConfig.welcome.replace("@user", `@${p.split("@")[0]}`);
+        await sock.sendMessage(id, { text, mentions: [p] });
       }
     }
-    if (update.action === "remove" && welcomeByeMsg.bye) {
-      for (let user of update.participants) {
-        await sock.sendMessage(update.id, {
-          text: replacePlaceholders(
-            welcomeByeMsg.bye.replace(/@user/gi, `@${user.split("@")[0]}`),
-            {},
-            metadata.subject
-          ),
-          mentions: [user],
-        });
+    if (action === "remove" && groupConfig.bye) {
+      for (const p of participants) {
+        const text = groupConfig.bye.replace("@user", `@${p.split("@")[0]}`);
+        await sock.sendMessage(id, { text, mentions: [p] });
       }
     }
   });
 }
 
-// ==== EXPRESS SERVER ====
-const app = express();
-const port = process.env.PORT || 3000;
-app.get("/", (req, res) => res.send("Bot is running!"));
-app.listen(port, () => console.log(`Server running at port ${port}`));
-
-// RUN
 startBot();
