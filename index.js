@@ -1,179 +1,146 @@
-const {
-  default: makeWASocket,
-  useMultiFileAuthState,
-  downloadMediaMessage,
-  DisconnectReason
-} = require("@whiskeysockets/baileys");
+const { Client, LocalAuth, MessageMedia } = require("whatsapp-web.js");
+const qrcode = require("qrcode-terminal");
 const fs = require("fs");
-const path = require("path");
 
-// === Load lists.json ===
-const LISTS_FILE = "lists.json";
-let lists = {};
-if (fs.existsSync(LISTS_FILE)) {
-  lists = JSON.parse(fs.readFileSync(LISTS_FILE));
-}
-function writeLists() {
-  fs.writeFileSync(LISTS_FILE, JSON.stringify(lists, null, 2));
+// Simpan daftar custom command
+const COMMANDS_FILE = "commands.json";
+let customCommands = {};
+if (fs.existsSync(COMMANDS_FILE)) {
+  try {
+    customCommands = JSON.parse(fs.readFileSync(COMMANDS_FILE));
+  } catch (e) {
+    console.error("❌ Gagal membaca commands.json:", e);
+  }
 }
 
-// === Placeholder handler ===
-function replacePlaceholders(text, groupMetadata, message) {
-  const now = new Date();
+// Inisialisasi client
+const client = new Client({
+  authStrategy: new LocalAuth(),
+});
+
+client.on("qr", (qr) => {
+  qrcode.generate(qr, { small: true });
+});
+
+client.on("ready", () => {
+  console.log("✅ Bot is running!");
+});
+
+// Fungsi untuk simpan command
+function saveCommands() {
+  fs.writeFileSync(COMMANDS_FILE, JSON.stringify(customCommands, null, 2));
+}
+
+// Replace placeholder
+function replacePlaceholders(text, msg) {
+  const date = new Date();
   return text
-    .replace(/@group/gi, groupMetadata?.subject || "")
-    .replace(/@date/gi, now.toLocaleDateString("id-ID"))
-    .replace(/@time/gi, now.toLocaleTimeString("id-ID"));
+    .replace(/@group/gi, msg.from.endsWith("@g.us") ? msg._data.notifyName || "Grup ini" : "Chat ini")
+    .replace(/@date/gi, date.toLocaleDateString("id-ID"))
+    .replace(/@time/gi, date.toLocaleTimeString("id-ID"));
 }
 
-// === Save media from message ===
-async function saveMediaMessage(sock, msg, name) {
-  const type = Object.keys(msg.message)[0];
-  const buffer = await downloadMediaMessage(msg, "buffer", {}, {});
+client.on("message", async (msg) => {
+  const chat = await msg.getChat();
+  const isGroup = chat.isGroup;
+  const isAdmin = isGroup && chat.participants.find(p => p.id._serialized === msg.author)?.isAdmin;
 
-  let ext = "";
-  if (type.includes("image")) ext = "jpg";
-  else if (type.includes("video")) ext = "mp4";
-  else if (type.includes("audio")) ext = "mp3";
-  else if (type.includes("document")) ext = "pdf";
-  else ext = "bin";
+  const body = msg.body.trim();
 
-  if (!fs.existsSync("media")) fs.mkdirSync("media");
-  const filePath = path.join("media", `${name}.${ext}`);
-  fs.writeFileSync(filePath, buffer);
-  return filePath;
-}
-
-// === Main Bot ===
-async function startBot() {
-  const { state, saveCreds } = await useMultiFileAuthState("auth");
-  const sock = makeWASocket({
-    auth: state,
-    printQRInTerminal: true
-  });
-
-  sock.ev.on("creds.update", saveCreds);
-
-  sock.ev.on("connection.update", (update) => {
-    const { connection, lastDisconnect } = update;
-    if (connection === "close") {
-      const shouldReconnect =
-        lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-      console.log("connection closed. reconnect:", shouldReconnect);
-      if (shouldReconnect) startBot();
-    } else if (connection === "open") {
-      console.log("✅ Bot is running!");
+  // ---- ADDLIST ----
+  if (body.startsWith(".addlist")) {
+    const input = body.replace(".addlist", "").trim();
+    let [name, ...contentArr] = input.split("||");
+    if (!name) {
+      msg.reply("⚠️ Format salah.\nGunakan:\n.addlist nama || isi\nAtau reply media dengan .addlist nama");
+      return;
     }
-  });
+    name = name.trim().toLowerCase();
+    let content = contentArr.join("||").trim();
 
-  sock.ev.on("messages.upsert", async ({ messages }) => {
-    const msg = messages[0];
-    if (!msg.message || msg.key.fromMe) return;
-
-    const from = msg.key.remoteJid;
-    const body =
-      msg.message.conversation ||
-      msg.message.extendedTextMessage?.text ||
-      "";
-
-    const lowerBody = body.trim().toLowerCase();
-
-    // === Commands ===
-    if (lowerBody.startsWith(".addlist")) {
-      const [_, rest] = body.split(" ", 2);
-      const parts = body.replace(".addlist", "").trim().split("||");
-      const listName = parts[0]?.trim().toLowerCase();
-      const listText = parts[1]?.trim() || "";
-
-      let mediaPath = null;
-      const msgType = Object.keys(msg.message)[0];
-      if (
-        ["imageMessage", "videoMessage", "audioMessage", "documentMessage"].includes(
-          msgType
-        )
-      ) {
-        mediaPath = await saveMediaMessage(sock, msg, listName);
-      }
-
-      if (!lists[from]) lists[from] = {};
-      lists[from][listName] = { text: listText, media: mediaPath };
-      writeLists();
-
-      await sock.sendMessage(from, {
-        text: `✅ List "${listName}" berhasil ditambahkan!`
-      });
+    if (msg.hasMedia && !content) {
+      const media = await msg.downloadMedia();
+      customCommands[name] = { type: "media", media };
+    } else {
+      customCommands[name] = { type: "text", text: content };
     }
 
-    else if (lowerBody.startsWith(".updatelist")) {
-      const parts = body.replace(".updatelist", "").trim().split("||");
-      const listName = parts[0]?.trim().toLowerCase();
-      const listText = parts[1]?.trim() || "";
+    saveCommands();
+    msg.reply(`✅ List '${name}' berhasil ditambahkan.`);
+    return;
+  }
 
-      if (!lists[from] || !lists[from][listName]) {
-        await sock.sendMessage(from, { text: `❌ List "${listName}" tidak ada.` });
-        return;
-      }
+  // ---- UPDATELIST ----
+  if (body.startsWith(".updatelist")) {
+    const input = body.replace(".updatelist", "").trim();
+    let [name, ...contentArr] = input.split("||");
+    if (!name) {
+      msg.reply("⚠️ Format salah.\nGunakan:\n.updatelist nama || isi\nAtau reply media dengan .updatelist nama");
+      return;
+    }
+    name = name.trim().toLowerCase();
+    let content = contentArr.join("||").trim();
 
-      let mediaPath = lists[from][listName].media;
-      const msgType = Object.keys(msg.message)[0];
-      if (
-        ["imageMessage", "videoMessage", "audioMessage", "documentMessage"].includes(
-          msgType
-        )
-      ) {
-        mediaPath = await saveMediaMessage(sock, msg, listName);
-      }
-
-      lists[from][listName] = { text: listText, media: mediaPath };
-      writeLists();
-
-      await sock.sendMessage(from, {
-        text: `✅ List "${listName}" berhasil diperbarui!`
-      });
+    if (!customCommands[name]) {
+      msg.reply(`❌ List '${name}' belum ada. Gunakan .addlist untuk membuat baru.`);
+      return;
     }
 
-    // === Trigger list ===
-    else if (lists[from] && lists[from][lowerBody]) {
-      const { text, media } = lists[from][lowerBody];
-      const groupMetadata = from.endsWith("@g.us")
-        ? await sock.groupMetadata(from)
-        : null;
-      const replyText = replacePlaceholders(text, groupMetadata, msg);
-
-      if (media) {
-        let sendObj = {};
-        if (media.endsWith(".jpg")) sendObj.image = { url: media };
-        else if (media.endsWith(".mp4")) sendObj.video = { url: media };
-        else if (media.endsWith(".mp3")) sendObj.audio = { url: media };
-        else sendObj.document = { url: media };
-
-        sendObj.caption = replyText || undefined;
-        await sock.sendMessage(from, sendObj);
-      } else {
-        await sock.sendMessage(from, { text: replyText });
-      }
+    if (msg.hasMedia && !content) {
+      const media = await msg.downloadMedia();
+      customCommands[name] = { type: "media", media };
+    } else {
+      customCommands[name] = { type: "text", text: content };
     }
 
-    // === Hidetag ===
-    else if (lowerBody.startsWith(".h")) {
-      let text =
-        body.replace(".h", "").trim() ||
-        msg.message?.extendedTextMessage?.contextInfo?.quotedMessage
-          ?.conversation;
+    saveCommands();
+    msg.reply(`✅ List '${name}' berhasil diperbarui.`);
+    return;
+  }
 
-      if (!text) return;
+  // ---- HIDETAG (.h) ----
+  if (body.startsWith(".h")) {
+    let text = body.replace(".h", "").trim();
 
-      const groupMetadata = from.endsWith("@g.us")
-        ? await sock.groupMetadata(from)
-        : null;
-      const participants = groupMetadata?.participants?.map((p) => p.id) || [];
-
-      await sock.sendMessage(from, {
-        text,
-        mentions: participants
-      });
+    if (msg.hasQuotedMsg) {
+      const quoted = await msg.getQuotedMessage();
+      text = quoted.body || text;
     }
-  });
-}
 
-startBot();
+    text = replacePlaceholders(text, msg);
+
+    if (isGroup) {
+      const mentions = chat.participants.map((p) => p.id._serialized);
+      chat.sendMessage(text, { mentions });
+    } else {
+      msg.reply(text);
+    }
+    return;
+  }
+
+  // ---- SHUTDOWN ----
+  if (body === ".shutdown") {
+    if (isAdmin) {
+      msg.reply("⚠️ Bot dimatikan oleh admin grup.");
+      setTimeout(() => process.exit(0), 1000);
+    } else {
+      msg.reply("❌ Hanya admin yang bisa mematikan bot.");
+    }
+    return;
+  }
+
+  // ---- TRIGGER LIST ----
+  const cmd = body.toLowerCase();
+  if (customCommands[cmd]) {
+    const data = customCommands[cmd];
+    if (data.type === "text") {
+      const text = replacePlaceholders(data.text, msg);
+      msg.reply(text);
+    } else if (data.type === "media") {
+      const media = new MessageMedia(data.media.mimetype, data.media.data, data.media.filename);
+      client.sendMessage(msg.from, media, { caption: replacePlaceholders(data.media.caption || "", msg) });
+    }
+  }
+});
+
+client.initialize();
