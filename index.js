@@ -2,6 +2,7 @@ const { default: makeWASocket, DisconnectReason, useMultiFileAuthState } = requi
 const pino = require('pino');
 const fs = require('fs');
 const path = require('path');
+const qrcode = require('qrcode-terminal');
 
 // Konfigurasi dasar
 const SESSION_DIR = './sessions';
@@ -31,7 +32,6 @@ async function startBot() {
   // Inisialisasi socket
   const sock = makeWASocket({
     auth: state,
-    printQRInTerminal: true,
     logger: pino({ level: 'silent' })
   });
   
@@ -40,7 +40,13 @@ async function startBot() {
   
   // Event handler untuk koneksi
   sock.ev.on('connection.update', (update) => {
-    const { connection, lastDisconnect } = update;
+    const { connection, lastDisconnect, qr } = update;
+    
+    // Tampilkan QR code jika tersedia
+    if (qr) {
+      console.log('Scan QR code berikut untuk login:');
+      qrcode.generate(qr, { small: true });
+    }
     
     if (connection === 'close') {
       const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
