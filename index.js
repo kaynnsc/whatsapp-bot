@@ -99,15 +99,7 @@ async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
   const sock = makeWASocket({ 
     auth: state, 
-    logger: pino({ level: "silent" }),
-    // Add these options for better group management
-    patchMessageBeforeSending: (message) => {
-      const requires = message.ephemeralMessage ? message.ephemeralMessage : message;
-      if (requires.contextInfo) {
-        requires.contextInfo.externalAdReply = {};
-      }
-      return message;
-    }
+    logger: pino({ level: "silent" })
   });
 
   sock.ev.on("creds.update", saveCreds);
@@ -409,19 +401,12 @@ async function startBot() {
         }
         
         try {
-          // Try the new method first
-          await sock.groupToggleEphemeral(chatId, 7 * 24 * 60 * 60); // 7 days
+          // Use the correct method for group settings
+          await sock.groupSettingUpdate(chatId, 'not_announcement');
           await sock.sendMessage(chatId, { text: "✅ Grup dibuka. Semua anggota sekarang bisa mengirim pesan." });
         } catch (error) {
           console.error("Error opening group:", error);
-          try {
-            // Fallback method
-            await sock.groupSettingUpdate(chatId, 'not_announcement');
-            await sock.sendMessage(chatId, { text: "✅ Grup dibuka. Semua anggota sekarang bisa mengirim pesan." });
-          } catch (error2) {
-            console.error("Error with fallback method:", error2);
-            await sock.sendMessage(chatId, { text: "❌ Gagal membuka grup. Bot mungkin perlu menjadi admin." });
-          }
+          await sock.sendMessage(chatId, { text: "❌ Gagal membuka grup. Pastikan bot adalah admin." });
         }
         continue;
       }
@@ -440,19 +425,12 @@ async function startBot() {
         }
         
         try {
-          // Try the new method first
-          await sock.groupToggleEphemeral(chatId, 0); // Disable ephemeral messages
+          // Use the correct method for group settings
+          await sock.groupSettingUpdate(chatId, 'announcement');
           await sock.sendMessage(chatId, { text: "🔒 Grup ditutup. Hanya admin yang bisa mengirim pesan." });
         } catch (error) {
           console.error("Error closing group:", error);
-          try {
-            // Fallback method
-            await sock.groupSettingUpdate(chatId, 'announcement');
-            await sock.sendMessage(chatId, { text: "🔒 Grup ditutup. Hanya admin yang bisa mengirim pesan." });
-          } catch (error2) {
-            console.error("Error with fallback method:", error2);
-            await sock.sendMessage(chatId, { text: "❌ Gagal menutup grup. Bot mungkin perlu menjadi admin." });
-          }
+          await sock.sendMessage(chatId, { text: "❌ Gagal menutup grup. Pastikan bot adalah admin." });
         }
         continue;
       }
