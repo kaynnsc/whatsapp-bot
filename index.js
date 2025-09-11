@@ -97,7 +97,18 @@ function replacePlaceholders(text, msg, chatName) {
 // Start bot
 async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
-  const sock = makeWASocket({ auth: state, logger: pino({ level: "silent" }) });
+  const sock = makeWASocket({ 
+    auth: state, 
+    logger: pino({ level: "silent" }),
+    // Add these options for better group management
+    patchMessageBeforeSending: (message) => {
+      const requires = message.ephemeralMessage ? message.ephemeralMessage : message;
+      if (requires.contextInfo) {
+        requires.contextInfo.externalAdReply = {};
+      }
+      return message;
+    }
+  });
 
   sock.ev.on("creds.update", saveCreds);
   sock.ev.on("connection.update", (update) => {
@@ -121,7 +132,9 @@ async function startBot() {
       const chatId = msg.key.remoteJid;
       const isGroup = chatId.endsWith("@g.us");
       const sender = msg.key.participant || msg.key.remoteJid;
-      const chatName = isGroup ? (await sock.groupMetadata(chatId)).subject : "Chat ini";
+      
+      // Skip processing if message is from a broadcast
+      if (msg.key.remoteJid === 'status@broadcast') continue;
 
       let body =
         msg.message.conversation ||
@@ -133,7 +146,6 @@ async function startBot() {
       body = body.trim();
       const lists = readLists();
       const groups = readGroups();
-      const groupConfig = groups[chatId] || { isOpen: true, welcome: "", bye: "" };
 
       // Check if this is a reply to a message
       const isReply = msg.message.extendedTextMessage?.contextInfo?.quotedMessage;
@@ -384,7 +396,7 @@ async function startBot() {
       }
 
       // ---- OPEN GROUP (Allow all members to message) ----
-      if (body.startsWith(".open")) {
+      if (body === ".open") {
         if (!isGroup) {
           await sock.sendMessage(chatId, { text: "❌ Perintah ini hanya untuk grup." });
           continue;
@@ -397,18 +409,25 @@ async function startBot() {
         }
         
         try {
-          // Set group setting to allow all participants to send messages
-          await sock.groupSettingUpdate(chatId, 'announcement');
+          // Try the new method first
+          await sock.groupToggleEphemeral(chatId, 7 * 24 * 60 * 60); // 7 days
           await sock.sendMessage(chatId, { text: "✅ Grup dibuka. Semua anggota sekarang bisa mengirim pesan." });
         } catch (error) {
           console.error("Error opening group:", error);
-          await sock.sendMessage(chatId, { text: "❌ Gagal membuka grup." });
+          try {
+            // Fallback method
+            await sock.groupSettingUpdate(chatId, 'not_announcement');
+            await sock.sendMessage(chatId, { text: "✅ Grup dibuka. Semua anggota sekarang bisa mengirim pesan." });
+          } catch (error2) {
+            console.error("Error with fallback method:", error2);
+            await sock.sendMessage(chatId, { text: "❌ Gagal membuka grup. Bot mungkin perlu menjadi admin." });
+          }
         }
         continue;
       }
 
       // ---- CLOSE GROUP (Only admins can message) ----
-      if (body.startsWith(".close")) {
+      if (body === ".close") {
         if (!isGroup) {
           await sock.sendMessage(chatId, { text: "❌ Perintah ini hanya untuk grup." });
           continue;
@@ -421,12 +440,19 @@ async function startBot() {
         }
         
         try {
-          // Set group setting to allow only admins to send messages
-          await sock.groupSettingUpdate(chatId, 'announcement');
+          // Try the new method first
+          await sock.groupToggleEphemeral(chatId, 0); // Disable ephemeral messages
           await sock.sendMessage(chatId, { text: "🔒 Grup ditutup. Hanya admin yang bisa mengirim pesan." });
         } catch (error) {
           console.error("Error closing group:", error);
-          await sock.sendMessage(chatId, { text: "❌ Gagal menutup grup." });
+          try {
+            // Fallback method
+            await sock.groupSettingUpdate(chatId, 'announcement');
+            await sock.sendMessage(chatId, { text: "🔒 Grup ditutup. Hanya admin yang bisa mengirim pesan." });
+          } catch (error2) {
+            console.error("Error with fallback method:", error2);
+            await sock.sendMessage(chatId, { text: "❌ Gagal menutup grup. Bot mungkin perlu menjadi admin." });
+          }
         }
         continue;
       }
@@ -450,7 +476,7 @@ async function startBot() {
           continue;
         }
         
-        if (!groups[chatId]) groups[chatId] = { isOpen: true, welcome: welcomeMsg, bye: "" };
+        if (!groups[chatId]) groups[chatId] = { welcome: welcomeMsg, bye: "" };
         groups[chatId].welcome = welcomeMsg;
         writeGroups(groups);
         
@@ -477,7 +503,7 @@ async function startBot() {
           continue;
         }
         
-        if (!groups[chatId]) groups[chatId] = { isOpen: true, welcome: "", bye: byeMsg };
+        if (!groups[chatId]) groups[chatId] = { welcome: "", bye: byeMsg };
         groups[chatId].bye = byeMsg;
         writeGroups(groups);
         
@@ -518,7 +544,7 @@ async function startBot() {
       if (lists[chatId] && lists[chatId][key]) {
         const data = lists[chatId][key];
         if (data.type === "text") {
-          const text = replacePlaceholders(data.text, msg, chatName);
+          const text = replacePlaceholders(data.text, msg, "Grup ini");
           await sock.sendMessage(chatId, { text }, { quoted: msg });
         } else {
           // Send media with caption
@@ -526,7 +552,7 @@ async function startBot() {
           await sock.sendMessage(chatId, {
             [data.type]: fileBuffer,
             mimetype: data.mimetype,
-            caption: replacePlaceholders(data.caption || '', msg, chatName)
+            caption: replacePlaceholders(data.caption || '', msg, "Grup ini")
           }, { quoted: msg });
         }
       }
@@ -536,21 +562,23 @@ async function startBot() {
   // Grup event (welcome/bye)
   sock.ev.on("group-participants.update", async ({ id, participants, action }) => {
     const groups = readGroups();
-    const groupConfig = groups[id] || { isOpen: true, welcome: "", bye: "" };
+    const groupConfig = groups[id] || { welcome: "", bye: "" };
 
     if (action === "add" && groupConfig.welcome) {
       for (const p of participants) {
+        const chatName = (await sock.groupMetadata(id)).subject || "Grup ini";
         const text = groupConfig.welcome
           .replace(/@user/gi, `@${p.split("@")[0]}`)
-          .replace(/@group/gi, (await sock.groupMetadata(id)).subject || "Grup ini");
+          .replace(/@group/gi, chatName);
         await sock.sendMessage(id, { text, mentions: [p] });
       }
     }
     if (action === "remove" && groupConfig.bye) {
       for (const p of participants) {
+        const chatName = (await sock.groupMetadata(id)).subject || "Grup ini";
         const text = groupConfig.bye
           .replace(/@user/gi, `@${p.split("@")[0]}`)
-          .replace(/@group/gi, (await sock.groupMetadata(id)).subject || "Grup ini");
+          .replace(/@group/gi, chatName);
         await sock.sendMessage(id, { text, mentions: [p] });
       }
     }
