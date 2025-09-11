@@ -21,10 +21,34 @@ if (!fs.existsSync(LIST_FILE)) fs.writeFileSync(LIST_FILE, JSON.stringify({}));
 if (!fs.existsSync(GROUP_FILE)) fs.writeFileSync(GROUP_FILE, JSON.stringify({}));
 
 // Helper read/write
-const readLists = () => JSON.parse(fs.readFileSync(LIST_FILE, 'utf-8'));
+const readLists = () => {
+  try {
+    return JSON.parse(fs.readFileSync(LIST_FILE, 'utf-8'));
+  } catch (e) {
+    return {};
+  }
+};
 const writeLists = (d) => fs.writeFileSync(LIST_FILE, JSON.stringify(d, null, 2));
-const readGroups = () => JSON.parse(fs.readFileSync(GROUP_FILE, 'utf-8'));
+const readGroups = () => {
+  try {
+    return JSON.parse(fs.readFileSync(GROUP_FILE, 'utf-8'));
+  } catch (e) {
+    return {};
+  }
+};
 const writeGroups = (d) => fs.writeFileSync(GROUP_FILE, JSON.stringify(d, null, 2));
+
+// Check if user is admin
+async function isAdmin(sock, chatId, userId) {
+  try {
+    const metadata = await sock.groupMetadata(chatId);
+    const participant = metadata.participants.find(p => p.id === userId);
+    return participant && (participant.admin === 'admin' || participant.admin === 'superadmin');
+  } catch (error) {
+    console.error("Error checking admin status:", error);
+    return false;
+  }
+}
 
 // Download media function
 async function downloadMedia(message, filename) {
@@ -66,7 +90,8 @@ function replacePlaceholders(text, msg, chatName) {
   return text
     .replace(/@group/gi, chatName || "Grup ini")
     .replace(/@date/gi, d.toLocaleDateString("id-ID"))
-    .replace(/@time/gi, d.toLocaleTimeString("id-ID"));
+    .replace(/@time/gi, d.toLocaleTimeString("id-ID"))
+    .replace(/@user/gi, `@${(msg.key.participant || msg.key.remoteJid).split('@')[0]}`);
 }
 
 // Start bot
@@ -110,8 +135,64 @@ async function startBot() {
       const groups = readGroups();
       const groupConfig = groups[chatId] || { isOpen: true, welcome: "", bye: "" };
 
-      // ---- ADDLIST ----
-      if (body.startsWith(".addlist")) {
+      // Check if this is a reply to a message
+      const isReply = msg.message.extendedTextMessage?.contextInfo?.quotedMessage;
+      const repliedMsg = isReply ? msg.message.extendedTextMessage.contextInfo : null;
+      
+      // ---- ADDLIST (with reply) ----
+      if (body.startsWith(".addlist") && isReply) {
+        const input = body.replace(".addlist", "").trim();
+        let [name] = input.split(" ");
+        if (!name) {
+          await sock.sendMessage(chatId, { text: "⚠️ Format: Balas sebuah pesan dengan `.addlist nama`" });
+          continue;
+        }
+        name = name.trim().toLowerCase();
+
+        if (!lists[chatId]) lists[chatId] = {};
+        
+        // Get the replied message content
+        const repliedContent = repliedMsg.quotedMessage;
+        
+        // Handle media messages
+        if (repliedContent.imageMessage || repliedContent.videoMessage) {
+          try {
+            const filename = `${chatId.replace(/[^a-zA-Z0-9]/g, '_')}_${name}_${Date.now()}`;
+            const mediaData = await downloadMedia(repliedContent, filename);
+            
+            if (mediaData) {
+              lists[chatId][name] = {
+                type: mediaData.type,
+                path: mediaData.path,
+                mimetype: mediaData.mimetype,
+                caption: input.replace(name, "").trim() || mediaData.caption
+              };
+              await sock.sendMessage(chatId, { text: `✅ List '${name}' dengan media ditambahkan.` }, { quoted: msg });
+            } else {
+              await sock.sendMessage(chatId, { text: "❌ Gagal memproses media." }, { quoted: msg });
+            }
+          } catch (error) {
+            console.error("Error downloading media:", error);
+            await sock.sendMessage(chatId, { text: "❌ Error memproses media." }, { quoted: msg });
+          }
+        } else {
+          // Handle text messages
+          const repliedText = repliedContent.conversation || 
+                             repliedContent.extendedTextMessage?.text ||
+                             "";
+          lists[chatId][name] = { 
+            type: "text", 
+            text: input.replace(name, "").trim() || repliedText 
+          };
+          await sock.sendMessage(chatId, { text: `✅ List '${name}' ditambahkan.` }, { quoted: msg });
+        }
+
+        writeLists(lists);
+        continue;
+      }
+      
+      // ---- ADDLIST (without reply) ----
+      else if (body.startsWith(".addlist")) {
         const input = body.replace(".addlist", "").trim();
         let [name, ...contentArr] = input.split("||");
         if (!name) {
@@ -154,8 +235,104 @@ async function startBot() {
         continue;
       }
 
-      // ---- UPDATELIST ----
-      if (body.startsWith(".updatelist")) {
+      // ---- DELLIST ----
+      if (body.startsWith(".dellist")) {
+        const name = body.replace(".dellist", "").trim().toLowerCase();
+        
+        if (!name) {
+          await sock.sendMessage(chatId, { text: "⚠️ Format: .dellist nama" });
+          continue;
+        }
+        
+        if (!lists[chatId] || !lists[chatId][name]) {
+          await sock.sendMessage(chatId, { text: `❌ List '${name}' tidak ditemukan.` });
+          continue;
+        }
+        
+        // Delete media file if exists
+        if (lists[chatId][name].path && fs.existsSync(lists[chatId][name].path)) {
+          try {
+            fs.unlinkSync(lists[chatId][name].path);
+          } catch (error) {
+            console.error("Error deleting media file:", error);
+          }
+        }
+        
+        // Remove from list
+        delete lists[chatId][name];
+        
+        // Clean up empty chat entries
+        if (Object.keys(lists[chatId]).length === 0) {
+          delete lists[chatId];
+        }
+        
+        writeLists(lists);
+        await sock.sendMessage(chatId, { text: `🗑️ List '${name}' telah dihapus.` }, { quoted: msg });
+        continue;
+      }
+
+      // ---- UPDATELIST (with reply) ----
+      if (body.startsWith(".updatelist") && isReply) {
+        const input = body.replace(".updatelist", "").trim();
+        let [name] = input.split(" ");
+        if (!name) {
+          await sock.sendMessage(chatId, { text: "⚠️ Format: Balas sebuah pesan dengan `.updatelist nama`" });
+          continue;
+        }
+        name = name.trim().toLowerCase();
+
+        if (!lists[chatId] || !lists[chatId][name]) {
+          await sock.sendMessage(chatId, { text: `❌ List '${name}' belum ada.` });
+          continue;
+        }
+
+        // Get the replied message content
+        const repliedContent = repliedMsg.quotedMessage;
+        
+        // Handle media updates
+        if (repliedContent.imageMessage || repliedContent.videoMessage) {
+          try {
+            // Delete old media file if exists
+            if (lists[chatId][name].path && fs.existsSync(lists[chatId][name].path)) {
+              fs.unlinkSync(lists[chatId][name].path);
+            }
+            
+            const filename = `${chatId.replace(/[^a-zA-Z0-9]/g, '_')}_${name}_${Date.now()}`;
+            const mediaData = await downloadMedia(repliedContent, filename);
+            
+            if (mediaData) {
+              lists[chatId][name] = {
+                type: mediaData.type,
+                path: mediaData.path,
+                mimetype: mediaData.mimetype,
+                caption: input.replace(name, "").trim() || mediaData.caption
+              };
+              await sock.sendMessage(chatId, { text: `♻️ List '${name}' dengan media diperbarui.` }, { quoted: msg });
+            } else {
+              await sock.sendMessage(chatId, { text: "❌ Gagal memproses media." }, { quoted: msg });
+            }
+          } catch (error) {
+            console.error("Error updating media:", error);
+            await sock.sendMessage(chatId, { text: "❌ Error memproses media." }, { quoted: msg });
+          }
+        } else {
+          // Handle text updates
+          const repliedText = repliedContent.conversation || 
+                             repliedContent.extendedTextMessage?.text ||
+                             "";
+          lists[chatId][name] = { 
+            type: "text", 
+            text: input.replace(name, "").trim() || repliedText 
+          };
+          await sock.sendMessage(chatId, { text: `♻️ List '${name}' diperbarui.` }, { quoted: msg });
+        }
+
+        writeLists(lists);
+        continue;
+      }
+      
+      // ---- UPDATELIST (without reply) ----
+      else if (body.startsWith(".updatelist")) {
         const input = body.replace(".updatelist", "").trim();
         let [name, ...contentArr] = input.split("||");
         if (!name) {
@@ -206,6 +383,102 @@ async function startBot() {
         continue;
       }
 
+      // ---- OPEN GROUP ----
+      if (body.startsWith(".open")) {
+        if (!isGroup) {
+          await sock.sendMessage(chatId, { text: "❌ Perintah ini hanya untuk grup." });
+          continue;
+        }
+        
+        // Check if user is admin
+        if (!await isAdmin(sock, chatId, sender)) {
+          await sock.sendMessage(chatId, { text: "❌ Hanya admin yang bisa membuka grup." });
+          continue;
+        }
+        
+        if (!groups[chatId]) groups[chatId] = { isOpen: true, welcome: "", bye: "" };
+        groups[chatId].isOpen = true;
+        writeGroups(groups);
+        
+        await sock.sendMessage(chatId, { text: "✅ Grup dibuka. Bot sekarang aktif di grup ini." });
+        continue;
+      }
+
+      // ---- CLOSE GROUP ----
+      if (body.startsWith(".close")) {
+        if (!isGroup) {
+          await sock.sendMessage(chatId, { text: "❌ Perintah ini hanya untuk grup." });
+          continue;
+        }
+        
+        // Check if user is admin
+        if (!await isAdmin(sock, chatId, sender)) {
+          await sock.sendMessage(chatId, { text: "❌ Hanya admin yang bisa menutup grup." });
+          continue;
+        }
+        
+        if (!groups[chatId]) groups[chatId] = { isOpen: false, welcome: "", bye: "" };
+        groups[chatId].isOpen = false;
+        writeGroups(groups);
+        
+        await sock.sendMessage(chatId, { text: "🔒 Grup ditutup. Bot tidak akan merespons di grup ini." });
+        continue;
+      }
+
+      // ---- SETWELCOME ----
+      if (body.startsWith(".setwelcome")) {
+        if (!isGroup) {
+          await sock.sendMessage(chatId, { text: "❌ Perintah ini hanya untuk grup." });
+          continue;
+        }
+        
+        // Check if user is admin
+        if (!await isAdmin(sock, chatId, sender)) {
+          await sock.sendMessage(chatId, { text: "❌ Hanya admin yang bisa mengatur welcome message." });
+          continue;
+        }
+        
+        const welcomeMsg = body.replace(".setwelcome", "").trim();
+        if (!welcomeMsg) {
+          await sock.sendMessage(chatId, { text: "⚠️ Format: .setwelcome pesan\nGunakan @user untuk mention anggota baru, @group untuk nama grup" });
+          continue;
+        }
+        
+        if (!groups[chatId]) groups[chatId] = { isOpen: true, welcome: welcomeMsg, bye: "" };
+        groups[chatId].welcome = welcomeMsg;
+        writeGroups(groups);
+        
+        await sock.sendMessage(chatId, { text: `✅ Welcome message disetel:\n${welcomeMsg}` });
+        continue;
+      }
+
+      // ---- SETBYE ----
+      if (body.startsWith(".setbye")) {
+        if (!isGroup) {
+          await sock.sendMessage(chatId, { text: "❌ Perintah ini hanya untuk grup." });
+          continue;
+        }
+        
+        // Check if user is admin
+        if (!await isAdmin(sock, chatId, sender)) {
+          await sock.sendMessage(chatId, { text: "❌ Hanya admin yang bisa mengatur bye message." });
+          continue;
+        }
+        
+        const byeMsg = body.replace(".setbye", "").trim();
+        if (!byeMsg) {
+          await sock.sendMessage(chatId, { text: "⚠️ Format: .setbye pesan\nGunakan @user untuk mention anggota yang keluar, @group untuk nama grup" });
+          continue;
+        }
+        
+        if (!groups[chatId]) groups[chatId] = { isOpen: true, welcome: "", bye: byeMsg };
+        groups[chatId].bye = byeMsg;
+        writeGroups(groups);
+        
+        await sock.sendMessage(chatId, { text: `✅ Bye message disetel:\n${byeMsg}` });
+        continue;
+      }
+
       // ---- HIDETAG ----
       if (body.startsWith(".h")) {
         const text = msg.message.extendedTextMessage?.contextInfo?.quotedMessage?.conversation ||
@@ -235,6 +508,11 @@ async function startBot() {
       }
 
       // ---- TRIGGER LIST ----
+      // Check if group is open (only for groups)
+      if (isGroup && groups[chatId] && !groups[chatId].isOpen) {
+        continue; // Skip processing if group is closed
+      }
+      
       const key = body.toLowerCase();
       if (lists[chatId] && lists[chatId][key]) {
         const data = lists[chatId][key];
@@ -257,17 +535,24 @@ async function startBot() {
   // Grup event (welcome/bye)
   sock.ev.on("group-participants.update", async ({ id, participants, action }) => {
     const groups = readGroups();
-    const groupConfig = groups[id] || { welcome: "", bye: "" };
+    const groupConfig = groups[id] || { isOpen: true, welcome: "", bye: "" };
+
+    // Skip if group is closed
+    if (!groupConfig.isOpen) return;
 
     if (action === "add" && groupConfig.welcome) {
       for (const p of participants) {
-        const text = groupConfig.welcome.replace("@user", `@${p.split("@")[0]}`);
+        const text = groupConfig.welcome
+          .replace(/@user/gi, `@${p.split("@")[0]}`)
+          .replace(/@group/gi, (await sock.groupMetadata(id)).subject || "Grup ini");
         await sock.sendMessage(id, { text, mentions: [p] });
       }
     }
     if (action === "remove" && groupConfig.bye) {
       for (const p of participants) {
-        const text = groupConfig.bye.replace("@user", `@${p.split("@")[0]}`);
+        const text = groupConfig.bye
+          .replace(/@user/gi, `@${p.split("@")[0]}`)
+          .replace(/@group/gi, (await sock.groupMetadata(id)).subject || "Grup ini");
         await sock.sendMessage(id, { text, mentions: [p] });
       }
     }
