@@ -383,7 +383,7 @@ async function startBot() {
         continue;
       }
 
-      // ---- OPEN GROUP ----
+      // ---- OPEN GROUP (Allow all members to message) ----
       if (body.startsWith(".open")) {
         if (!isGroup) {
           await sock.sendMessage(chatId, { text: "❌ Perintah ini hanya untuk grup." });
@@ -396,15 +396,18 @@ async function startBot() {
           continue;
         }
         
-        if (!groups[chatId]) groups[chatId] = { isOpen: true, welcome: "", bye: "" };
-        groups[chatId].isOpen = true;
-        writeGroups(groups);
-        
-        await sock.sendMessage(chatId, { text: "✅ Grup dibuka. Bot sekarang aktif di grup ini." });
+        try {
+          // Set group setting to allow all participants to send messages
+          await sock.groupSettingUpdate(chatId, 'announcement');
+          await sock.sendMessage(chatId, { text: "✅ Grup dibuka. Semua anggota sekarang bisa mengirim pesan." });
+        } catch (error) {
+          console.error("Error opening group:", error);
+          await sock.sendMessage(chatId, { text: "❌ Gagal membuka grup." });
+        }
         continue;
       }
 
-      // ---- CLOSE GROUP ----
+      // ---- CLOSE GROUP (Only admins can message) ----
       if (body.startsWith(".close")) {
         if (!isGroup) {
           await sock.sendMessage(chatId, { text: "❌ Perintah ini hanya untuk grup." });
@@ -417,11 +420,14 @@ async function startBot() {
           continue;
         }
         
-        if (!groups[chatId]) groups[chatId] = { isOpen: false, welcome: "", bye: "" };
-        groups[chatId].isOpen = false;
-        writeGroups(groups);
-        
-        await sock.sendMessage(chatId, { text: "🔒 Grup ditutup. Bot tidak akan merespons di grup ini." });
+        try {
+          // Set group setting to allow only admins to send messages
+          await sock.groupSettingUpdate(chatId, 'announcement');
+          await sock.sendMessage(chatId, { text: "🔒 Grup ditutup. Hanya admin yang bisa mengirim pesan." });
+        } catch (error) {
+          console.error("Error closing group:", error);
+          await sock.sendMessage(chatId, { text: "❌ Gagal menutup grup." });
+        }
         continue;
       }
 
@@ -508,11 +514,6 @@ async function startBot() {
       }
 
       // ---- TRIGGER LIST ----
-      // Check if group is open (only for groups)
-      if (isGroup && groups[chatId] && !groups[chatId].isOpen) {
-        continue; // Skip processing if group is closed
-      }
-      
       const key = body.toLowerCase();
       if (lists[chatId] && lists[chatId][key]) {
         const data = lists[chatId][key];
@@ -536,9 +537,6 @@ async function startBot() {
   sock.ev.on("group-participants.update", async ({ id, participants, action }) => {
     const groups = readGroups();
     const groupConfig = groups[id] || { isOpen: true, welcome: "", bye: "" };
-
-    // Skip if group is closed
-    if (!groupConfig.isOpen) return;
 
     if (action === "add" && groupConfig.welcome) {
       for (const p of participants) {
